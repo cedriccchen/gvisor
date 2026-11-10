@@ -20,9 +20,11 @@ import (
 	"os"
 	"slices"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 )
 
@@ -732,4 +734,120 @@ func TestZeroDiskBackedPanicsOnNonzeroUnwritablePage(t *testing.T) {
 		}
 	}()
 	zeroDiskBacked(fd, 0, m)
+}
+
+// waitDestroyed waits for the releaser goroutine to finish destroying f.
+func waitDestroyed(t *testing.T, f *MemoryFile) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		f.mu.Lock()
+		done := f.file == nil
+		if done {
+			for i, chunk := range f.chunksLoad() {
+				if chunk.mapping != 0 {
+					t.Errorf("chunk %d is still mapped at %#x", i, chunk.mapping)
+				}
+			}
+		}
+		f.mu.Unlock()
+		if done {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("MemoryFile was not destroyed within 10s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Destroy truncates disk-backed files, and cleans up even if truncation fails.
+func TestDestroyTruncate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// If sealShrink is true, the MemoryFile is backed by a memfd that is
+		// sealed against shrinking before destruction, so that truncation
+		// fails. Otherwise, it is backed by a temporary file.
+		sealShrink bool
+	}{
+		{name: "disk-backed file is truncated"},
+		{name: "truncation failure", sealShrink: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var file *os.File
+			if tc.sealShrink {
+				memfd, err := memutil.CreateMemFD("pgalloc-destroy-test", unix.MFD_ALLOW_SEALING)
+				if err != nil {
+					t.Fatalf("CreateMemFD: %v", err)
+				}
+				file = os.NewFile(uintptr(memfd), "pgalloc-destroy-test")
+			} else {
+				var err error
+				if file, err = os.CreateTemp(t.TempDir(), "pgalloc-destroy-test"); err != nil {
+					t.Fatalf("CreateTemp: %v", err)
+				}
+			}
+			// Destroy closes file, so inspect it through a duplicate.
+			fd, err := unix.Dup(int(file.Fd()))
+			if err != nil {
+				file.Close()
+				t.Fatalf("Dup: %v", err)
+			}
+			defer unix.Close(fd)
+			// An empty file can already have blocks allocated, e.g. for an
+			// inherited ACL on ext4.
+			var empty unix.Stat_t
+			if err := unix.Fstat(fd, &empty); err != nil {
+				t.Fatalf("Fstat: %v", err)
+			}
+
+			f, err := NewMemoryFile(file, MemoryFileOpts{
+				DelayedEviction:         DelayedEvictionDisabled,
+				DiskBackedFile:          true,
+				DisableMemoryAccounting: true,
+			})
+			if err != nil {
+				file.Close()
+				t.Fatalf("NewMemoryFile: %v", err)
+			}
+			const pages = 16
+			fr, err := f.Allocate(pages*hostarch.PageSize, AllocOpts{Mode: AllocateUncommitted})
+			if err != nil {
+				t.Fatalf("Allocate: %v", err)
+			}
+			for i := 0; i < pages; i++ {
+				pwritePage(t, f, fr, i, 1)
+			}
+			var before unix.Stat_t
+			if err := unix.Fstat(fd, &before); err != nil {
+				t.Fatalf("Fstat: %v", err)
+			}
+			if tc.sealShrink {
+				if _, err := unix.FcntlInt(uintptr(fd), unix.F_ADD_SEALS, unix.F_SEAL_SHRINK); err != nil {
+					t.Fatalf("F_ADD_SEALS: %v", err)
+				}
+			}
+
+			f.DecRef(fr)
+			f.Destroy()
+			waitDestroyed(t, f)
+
+			var after unix.Stat_t
+			if err := unix.Fstat(fd, &after); err != nil {
+				t.Fatalf("Fstat: %v", err)
+			}
+			if tc.sealShrink {
+				if after.Size != before.Size {
+					t.Errorf("file size after Destroy: got %d, want %d", after.Size, before.Size)
+				}
+			} else {
+				if after.Size != 0 {
+					t.Errorf("file size after Destroy: got %d, want 0", after.Size)
+				}
+				if after.Blocks != empty.Blocks {
+					t.Errorf("allocated blocks after Destroy: got %d, want %d", after.Blocks, empty.Blocks)
+				}
+			}
+		})
+	}
 }

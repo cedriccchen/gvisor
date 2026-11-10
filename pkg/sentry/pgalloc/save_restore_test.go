@@ -397,7 +397,6 @@ func BenchmarkSaveToDiskBacked(b *testing.B) {
 					DelayedEviction:         DelayedEvictionDisabled,
 					DisableMemoryAccounting: true,
 					DiskBackedFile:          true,
-					DecommitOnDestroy:       true,
 				})
 				if err != nil {
 					b.Fatalf("NewMemoryFile: %v", err)

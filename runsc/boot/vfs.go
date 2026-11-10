@@ -1227,8 +1227,6 @@ func createPrivateMemoryFile(file *os.File, resourceID checkpoint.ResourceID, ci
 	mfOpts := pgalloc.MemoryFileOpts{
 		// Private memory files are usually backed by files on disk.
 		DiskBackedFile: true,
-		// Disk backed files need to be decommited on destroy to release disk space.
-		DecommitOnDestroy: true,
 		// Pages of a disk backed file are host page cache for that file, which
 		// the host may drop at any time, not memory held by the sandbox.
 		DisableMemoryAccounting: true,
